@@ -17,6 +17,32 @@ mod qlog;
 #[cfg(feature = "unstable-custom-transports")]
 pub mod test_transport;
 
+/// Test hooks for the `pending_open_paths` path-open retry queue in `remote_state`.
+pub mod path_cap_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Forces `open_path_on_conn` to take the `MaxPathIdReached` requeue branch.
+    pub(crate) static FORCE_MAX_PATH_ID_REACHED: AtomicBool = AtomicBool::new(false);
+
+    /// Largest observed `pending_open_paths` length across all remote-state actors.
+    pub(crate) static PENDING_OPEN_PATHS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Enables or disables simulated path-id exhaustion.
+    pub fn force_max_path_id_reached(enabled: bool) {
+        FORCE_MAX_PATH_ID_REACHED.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns the largest observed `pending_open_paths` length.
+    pub fn pending_open_paths_high_water() -> usize {
+        PENDING_OPEN_PATHS_HIGH_WATER.load(Ordering::Relaxed)
+    }
+
+    /// Resets the high-water mark.
+    pub fn reset_high_water() {
+        PENDING_OPEN_PATHS_HIGH_WATER.store(0, Ordering::Relaxed);
+    }
+}
+
 /// A drop guard to clean up test infrastructure.
 ///
 /// After dropping the test infrastructure will asynchronously shutdown and release its

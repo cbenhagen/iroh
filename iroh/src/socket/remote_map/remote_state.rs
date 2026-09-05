@@ -72,6 +72,30 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// in a high frequency, and to keep data about previous path around for subsequent connections.
 const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Cap on distinct addresses queued for a path-open retry (a backstop; normally a handful).
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+/// Enqueues `addr` for a later path-open retry, deduplicated and capped.
+///
+/// The retry re-attempts each queued addr on every connection to the peer, so a connection
+/// at its path-id cap re-queues the same addr; without dedup the queue grows by the
+/// connection count on every retry. The cap bounds a peer that advertises many addresses.
+fn enqueue_pending_open_path(
+    queue: &mut VecDeque<transports::FourTuple>,
+    addr: transports::FourTuple,
+) {
+    if queue.contains(&addr) {
+        return;
+    }
+    if queue.len() >= MAX_PENDING_OPEN_PATHS {
+        queue.pop_front();
+    }
+    queue.push_back(addr);
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::test_utils::path_cap_hooks::PENDING_OPEN_PATHS_HIGH_WATER
+        .fetch_max(queue.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A stream of events from all paths for all connections.
 ///
 /// The connection is identified using [`ConnId`].  The event `Err` variant happens when the
@@ -1043,6 +1067,16 @@ impl State {
             return;
         }
 
+        // Test hook: force the `MaxPathIdReached` requeue branch (unreachable via public API).
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::test_utils::path_cap_hooks::FORCE_MAX_PATH_ID_REACHED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.scheduled_open_path = Some(Instant::now() + Duration::from_millis(333));
+            enqueue_pending_open_path(&mut self.pending_open_paths, open_addr.clone());
+            return;
+        }
+
         let quic_addr =
             open_addr.to_noq_four_tuple(&self.relay_mapped_addrs, &self.custom_mapped_addrs);
         let path_status = self.path_status_for_addr(open_addr);
@@ -1059,7 +1093,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        enqueue_pending_open_path(&mut self.pending_open_paths, open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1526,5 +1560,48 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod pending_open_paths_tests {
+    use std::{
+        collections::VecDeque,
+        net::{Ipv4Addr, SocketAddr},
+    };
+
+    use super::{MAX_PENDING_OPEN_PATHS, enqueue_pending_open_path};
+    use crate::socket::transports::{Addr, FourTuple};
+
+    fn ip_addr(port: u16) -> FourTuple {
+        FourTuple::from_remote(Addr::Ip(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)))
+    }
+
+    #[test]
+    fn dedup_keeps_queue_at_distinct_addrs() {
+        let mut q = VecDeque::new();
+        let a = ip_addr(1000);
+        let b = ip_addr(1001);
+        // Re-enqueuing the same addr many times (as open_path_on_all_conns would across
+        // connections and retry ticks) must not grow the queue.
+        for _ in 0..10_000 {
+            enqueue_pending_open_path(&mut q, a.clone());
+            enqueue_pending_open_path(&mut q, b.clone());
+        }
+        assert_eq!(q.len(), 2, "queue must hold only the distinct addrs");
+        assert!(q.contains(&a) && q.contains(&b));
+    }
+
+    #[test]
+    fn cap_bounds_distinct_addrs_and_drops_oldest() {
+        let mut q = VecDeque::new();
+        // Enqueue far more distinct addrs than the cap.
+        for port in 0..(MAX_PENDING_OPEN_PATHS as u16 + 50) {
+            enqueue_pending_open_path(&mut q, ip_addr(port));
+        }
+        assert_eq!(q.len(), MAX_PENDING_OPEN_PATHS, "queue must be capped");
+        // Oldest (lowest ports) dropped; newest retained.
+        assert!(!q.contains(&ip_addr(0)));
+        assert!(q.contains(&ip_addr(MAX_PENDING_OPEN_PATHS as u16 + 49)));
     }
 }
